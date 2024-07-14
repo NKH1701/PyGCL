@@ -1,31 +1,50 @@
 import torch
 import torch.nn.functional as F
 import GCL.augmentors as A
+from GCL.eval import get_split, SVMEvaluator
 from GCL.models import DualBranchContrast
 from torch_geometric.data import DataLoader
 from torch_geometric.datasets import TUDataset
 from torch import nn
-from torch_geometric.nn import GCNConv
+from torch_geometric.nn import GCNConv, BatchNorm
 from torch_geometric.nn import global_add_pool
 import GCL.losses as L
 from torch.optim import Adam
 
 
 dataset = TUDataset(root='data/TUDataset', name='MUTAG')
-loader = DataLoader(dataset, batch_size=32, shuffle=True)
+loader = DataLoader(dataset, batch_size=128, shuffle=True)
+
 
 
 class GCN(nn.Module):
-    def __init__(self):
+    def __init__(self, in_channel, out_channel):
         super().__init__()
-        self.conv1 = GCNConv(dataset.num_features, 64)
-        self.conv2 = GCNConv(64, 64)
+        self.convs = nn.ModuleList()
+        self.batchNorms = nn.ModuleList()
+
+        for i in range(3):
+            if i == 0:
+                self.convs.append(GCNConv(in_channel, out_channel))
+            else:
+                self.convs.append(GCNConv(out_channel, out_channel))
+            self.batchNorms.append(BatchNorm(out_channel))
+
+        self.project = nn.Sequential(
+            nn.Linear(out_channel, out_channel),
+            nn.ReLU(),
+            nn.Linear(out_channel, out_channel)
+        )
 
     def forward(self, x, edge_index, batch):
-        x = self.conv1(x, edge_index)
-        x = F.relu(x)
-        x = self.conv2(x, edge_index)
+        for conv, bn in zip(self.convs, self.batchNorms):
+            x = conv(x, edge_index)
+            x = bn(x)
+            x = F.relu(x)
+
         x = global_add_pool(x, batch)
+        x = self.project(x)
+
         return x
 
 class Encoder(nn.Module):
@@ -46,8 +65,9 @@ class Encoder(nn.Module):
 augmentor1 = A.EdgeRemoving(pe=0.1)
 augmentor2 = A.FeatureMasking(pf=0.1)
 
+
 device = torch.device('cuda')
-gcn = GCN().to(device)
+gcn = GCN(dataset.num_features, 32).to(device)
 encoder = Encoder(gcn, augmentor1, augmentor2).to(device)
 contrast_model = DualBranchContrast(loss=L.InfoNCE(tau=0.2), mode='G2G').to(device)
 optimizer = Adam(encoder.parameters(), lr=0.01)
@@ -68,12 +88,31 @@ def train(epoch):
     print(f"Loss: {avg_loss:.4f}")
     return avg_loss
 
+def test():
+    encoder.eval()
+    x = []
+    y = []
+    with torch.no_grad():
+        for data in loader:
+            data = data.to(device)
+            g = encoder.encoder(data.x, data.edge_index, data.batch)
+            x.append(g)
+            y.append(data.y)
+    x = torch.cat(x, dim=0)
+    y = torch.cat(y, dim=0)
 
-for epoch in range(1, 30):
+    split = get_split(num_samples=x.size()[0], train_ratio=0.8, test_ratio=0.1)
+    result = SVMEvaluator(linear=True)(x, y, split)
+    return result
+
+
+for epoch in range(1, 100):
     print(f"Epoch {epoch}:\n")
     train(epoch)
     print("-------------------------------------------")
 
+test_result = test()
+print(f'(E): Best test F1Mi={test_result["micro_f1"]:.4f}, F1Ma={test_result["macro_f1"]:.4f}')
 
 
 
